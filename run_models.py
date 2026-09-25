@@ -32,9 +32,25 @@ Execution follows dag.py: models run in topological order, a cycle fails
 before anything runs, and if a model fails every model downstream of it is
 skipped while independent models still build.
 
+Late-arriving bills. Partitions are keyed on pickup date, but a shipment's
+bill arrives days later. Each batch has an as_of date and only sees bills
+received on or before it (getvariable('as_of')). The daily batch for as_of D
+rebuilds partitions D-lookback through D, oldest first, so a bill that arrives
+on D corrects its pickup date's partition as long as that date is within the
+lookback window. A bill that arrives later than that is not picked up.
+
+Commands:
+  run       the daily batch for one as_of date
+  backfill  replay the daily batch for every as_of date from --start to --end, in order
+  log       summarize a batch from the run log
+
+Every task's start, end, rows deleted and inserted, status, and any error is
+written to the DuckDB table ops.run_log (see run_log.py).
+
 Examples:
-  python run_models.py --run-date 2026-06-15
-  python run_models.py --run-date 2026-06-01 --end-date 2026-08-29   # backfill
+  python run_models.py run --date 2026-06-15
+  python run_models.py backfill --start 2026-06-01 --end 2026-09-15 --lookback 21
+  python run_models.py log
 """
 
 import argparse
@@ -46,10 +62,16 @@ from pathlib import Path
 
 import duckdb
 
-from dag import DAG, DAGError, TaskFailedError, TaskState
+from dag import DAG, DAGError, TaskState
+from run_log import SCHEMA as RUN_LOG_SCHEMA
+from run_log import TABLE as RUN_LOG_TABLE
+from run_log import RunLog
 
 LAYERS = ("staging", "intermediate", "marts")
 ROOT = Path(__file__).resolve().parent
+# Bills in this feed arrive 1-20 days after pickup, so 21 days of lookback
+# lets every one of them land in its pickup-date partition.
+DEFAULT_LOOKBACK = 21
 
 DEPENDS_ON = re.compile(r"^--\s*depends_on:(.*)$", re.MULTILINE | re.IGNORECASE)
 PARTITION_BY = re.compile(r"^--\s*partition_by:(.*)$", re.MULTILINE | re.IGNORECASE)
@@ -180,47 +202,103 @@ def write_partition(con, m):
     return WriteStats(deleted, inserted)
 
 
-def build_dag(con, models):
-    """One DAG task per model. Unknown upstreams and cycles are reported by the DAG."""
+def build_dag(con, models, run_date, as_of, run_log):
+    """One DAG task per model. Each task logs its start and end to the run log."""
     dag = DAG("sql_models")
     for m in models:
-        dag.add_task(m.key, lambda m=m: write_partition(con, m), m.depends_on)
+        def task(m=m):
+            log_id = run_log.start(m.key, run_date, as_of)
+            try:
+                stats = write_partition(con, m)
+            except BaseException as exc:
+                run_log.finish(log_id, error=exc)
+                raise
+            run_log.finish(log_id, stats)
+            return stats
+        dag.add_task(m.key, task, m.depends_on)
     return dag
 
 
-def build(con, models_dir, data_dir, run_date):
+def build(con, models_dir, data_dir, run_date, as_of=None, run_log=None):
     """Build every model's run_date partition and return the DAGRunResult.
+
+    Only bills received on or before as_of are visible; None makes every bill
+    visible. Every task is recorded in ops.run_log. Pass a RunLog to group
+    several builds under one batch_id.
 
     Invalid model files raise ModelError and cycles raise CycleError, in both
     cases before any model runs. Model failures do not raise: check the result,
     or call result.raise_for_failures().
     """
+    run_log = run_log or RunLog(con, "build")
     models = load_models(models_dir)
-    dag = build_dag(con, models)
+    dag = build_dag(con, models, run_date, as_of, run_log)
     dag.topological_order()  # fail on cycles/unknown models before touching the database
 
     data_dir = str(Path(data_dir).resolve()).replace("'", "''")
     con.execute(f"set file_search_path = '{data_dir}'")
     con.execute(f"set variable run_date = date '{run_date.isoformat()}'")
+    if as_of is None:
+        con.execute("set variable as_of = null::date")
+    else:
+        con.execute(f"set variable as_of = date '{as_of.isoformat()}'")
     for layer in LAYERS:
         con.execute(f'create schema if not exists "{layer}"')
-    return dag.run()
+    run_log.ensure_table()
+
+    result = dag.run()
+    for name in result.order:
+        r = result.results[name]
+        if r.state is TaskState.SKIPPED:
+            run_log.skipped(name, run_date, as_of, r.skipped_because)
+    return result
 
 
-def build_range(con, models_dir, data_dir, start, end):
-    """Build each date from start to end inclusive, stopping after the first date with a failure.
+def lookback_partitions(as_of, lookback):
+    """The run_dates a batch as of as_of reprocesses, oldest first."""
+    return [as_of - timedelta(days=k) for k in range(lookback, -1, -1)]
 
+
+def run_batch(con, models_dir, data_dir, as_of, lookback=DEFAULT_LOOKBACK, run_log=None):
+    """The daily batch for as_of: rebuild each partition in the lookback window, oldest first.
+
+    Every partition sees the bills received by as_of, so a bill that arrived
+    that day corrects its pickup date's partition as long as that date is
+    within `lookback` days. Stops at the first partition with a failure.
     Returns [(run_date, DAGRunResult), ...].
     """
+    run_log = run_log or RunLog(con, "run")
     runs = []
-    d = start
-    while d <= end:
-        result = build(con, models_dir, data_dir, d)
-        runs.append((d, result))
+    for run_date in lookback_partitions(as_of, lookback):
+        result = build(con, models_dir, data_dir, run_date, as_of, run_log)
+        runs.append((run_date, result))
         if not result.succeeded:
             break
-        d += timedelta(days=1)
     return runs
+
+
+def backfill(con, models_dir, data_dir, start, end, lookback=DEFAULT_LOOKBACK, run_log=None):
+    """Replay the daily batch for every as_of date from start to end, in order.
+
+    Stops after the first batch with a failure.
+    Returns [(as_of, [(run_date, DAGRunResult), ...]), ...].
+    """
+    if end < start:
+        raise ValueError("end must not be before start")
+    run_log = run_log or RunLog(con, "backfill")
+    batches = []
+    as_of = start
+    while as_of <= end:
+        runs = run_batch(con, models_dir, data_dir, as_of, lookback, run_log)
+        batches.append((as_of, runs))
+        if not batch_succeeded(runs):
+            break
+        as_of += timedelta(days=1)
+    return batches
+
+
+def batch_succeeded(runs):
+    return all(result.succeeded for _, result in runs)
 
 
 def print_summary(result):
@@ -234,47 +312,109 @@ def print_summary(result):
             detail = f"{type(r.error).__name__}: {str(r.error).splitlines()[0]}"
         else:
             detail = f"upstream {r.skipped_because} did not succeed"
-        print(f"  {name:<{width}}  {r.state.value.upper():<7}  {detail}")
+        print(f"    {name:<{width}}  {r.state.value.upper():<7}  {detail}")
 
 
-def main():
+def print_batch(as_of, runs):
+    tasks = sum(len(result.order) for _, result in runs)
+    inserted = sum(r.output.inserted for _, result in runs
+                   for r in result.results.values() if r.state is TaskState.SUCCESS)
+    print(f"as_of {as_of}  partitions {runs[0][0]}..{runs[-1][0]}  "
+          f"{tasks} tasks  {inserted:>7,} rows inserted")
+    for run_date, result in runs:
+        if not result.succeeded:
+            print(f"  run_date {run_date} FAILED:")
+            print_summary(result)
+
+
+def print_log(con, batch_id):
+    """Summarize one batch from the run log: counts by status, then any non-success rows."""
+    if not con.execute("select count(*) from duckdb_tables() where schema_name = ? and table_name = 'run_log'",
+                       [RUN_LOG_SCHEMA]).fetchone()[0]:
+        raise SystemExit("No run log yet: run or backfill first.")
+    if batch_id == "latest":
+        row = con.execute(f"select batch_id from {RUN_LOG_TABLE} order by log_id desc limit 1").fetchone()
+        if not row:
+            raise SystemExit("The run log is empty.")
+        batch_id = row[0]
+    head = con.execute(f"""
+        select any_value(command), min(as_of_date), max(as_of_date), min(run_date), max(run_date),
+               min(started_at), max(ended_at), count(*),
+               count(*) filter (status = 'success'), count(*) filter (status = 'failed'),
+               count(*) filter (status = 'skipped'), count(*) filter (status = 'running'),
+               coalesce(sum(rows_inserted), 0)
+        from {RUN_LOG_TABLE} where batch_id = ?""", [batch_id]).fetchone()
+    if not head[7]:
+        raise SystemExit(f"No run log rows for batch {batch_id}.")
+    (command, as_of_min, as_of_max, rd_min, rd_max, started, ended, total,
+     ok, failed, skipped, running, inserted) = head
+    print(f"batch    {batch_id}  ({command})")
+    print(f"as_of    {as_of_min}..{as_of_max}    run_dates {rd_min}..{rd_max}")
+    print(f"time     {started} -> {ended} UTC")
+    print(f"tasks    {total:,} total: {ok:,} success, {failed} failed, {skipped} skipped, {running} running")
+    print(f"rows     {inserted:,} inserted")
+    problems = con.execute(f"""
+        select as_of_date, run_date, task_name, status,
+               coalesce(error, 'upstream ' || skipped_because, '')
+        from {RUN_LOG_TABLE} where batch_id = ? and status <> 'success' order by log_id limit 20""",
+        [batch_id]).fetchall()
+    for as_of, run_date, task, status, detail in problems:
+        print(f"  {status.upper():<8} as_of {as_of} run_date {run_date} {task}: {detail.splitlines()[0]}")
+
+
+def main(argv=None):
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", type=Path, default=ROOT / "warehouse.duckdb",
+                        help="DuckDB database file (default ./warehouse.duckdb)")
+    common.add_argument("--data-dir", type=Path, default=ROOT / "data",
+                        help="directory holding the raw CSVs (default ./data)")
+    common.add_argument("--models-dir", type=Path, default=ROOT / "models",
+                        help="directory holding staging/intermediate/marts (default ./models)")
+    common.add_argument("-v", "--verbose", action="store_true", help="log each task as it runs")
+
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--run-date", type=date.fromisoformat, required=True,
-                   help="partition date to build, YYYY-MM-DD")
-    p.add_argument("--end-date", type=date.fromisoformat,
-                   help="also build every date after --run-date up to this one (backfill)")
-    p.add_argument("--db", type=Path, default=ROOT / "warehouse.duckdb",
-                   help="DuckDB database file (default ./warehouse.duckdb)")
-    p.add_argument("--data-dir", type=Path, default=ROOT / "data",
-                   help="directory holding the raw CSVs (default ./data)")
-    p.add_argument("--models-dir", type=Path, default=ROOT / "models",
-                   help="directory holding staging/intermediate/marts (default ./models)")
-    p.add_argument("-v", "--verbose", action="store_true", help="log each task as it runs")
-    args = p.parse_args()
-    end = args.end_date or args.run_date
-    if end < args.run_date:
-        p.error("--end-date must not be before --run-date")
+    sub = p.add_subparsers(dest="command", required=True)
+    run_p = sub.add_parser("run", parents=[common], help="daily batch for one as_of date")
+    run_p.add_argument("--date", type=date.fromisoformat, required=True,
+                       help="as_of date of the batch, YYYY-MM-DD")
+    bf_p = sub.add_parser("backfill", parents=[common], help="replay the daily batch for a date range")
+    bf_p.add_argument("--start", type=date.fromisoformat, required=True, help="first as_of date, YYYY-MM-DD")
+    bf_p.add_argument("--end", type=date.fromisoformat, required=True, help="last as_of date, YYYY-MM-DD")
+    for sp in (run_p, bf_p):
+        sp.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK,
+                        help=f"days of earlier partitions each batch reprocesses (default {DEFAULT_LOOKBACK})")
+    log_p = sub.add_parser("log", parents=[common], help="summarize a batch from the run log")
+    log_p.add_argument("--batch", default="latest", help="batch_id to show (default: the latest)")
+
+    args = p.parse_args(argv)
+    if getattr(args, "lookback", 0) < 0:
+        p.error("--lookback must be 0 or more")
+    if args.command == "backfill" and args.end < args.start:
+        p.error("--end must not be before --start")
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
 
-    try:
-        with duckdb.connect(str(args.db)) as con:
-            runs = build_range(con, args.models_dir, args.data_dir, args.run_date, end)
-    except DAGError as exc:
-        raise SystemExit(f"Invalid model graph, nothing was built. {exc}")
+    with duckdb.connect(str(args.db)) as con:
+        if args.command == "log":
+            print_log(con, args.batch)
+            return
+        run_log = RunLog(con, args.command)
+        try:
+            if args.command == "run":
+                batches = [(args.date, run_batch(con, args.models_dir, args.data_dir,
+                                                 args.date, args.lookback, run_log))]
+            else:
+                batches = backfill(con, args.models_dir, args.data_dir,
+                                   args.start, args.end, args.lookback, run_log)
+        except DAGError as exc:
+            raise SystemExit(f"Invalid model graph, nothing was built. {exc}")
 
-    for run_date, result in runs:
-        if len(runs) == 1 or not result.succeeded:
-            print(f"run_date {run_date}")
-            print_summary(result)
-        else:
-            inserted = sum(r.output.inserted for r in result.results.values())
-            print(f"run_date {run_date}  {len(result.order)} models  {inserted:>6,} rows inserted")
-    try:
-        runs[-1][1].raise_for_failures()
-    except TaskFailedError as exc:
-        raise SystemExit(f"Build for {runs[-1][0]} incomplete; later dates were not run. {exc}")
-    print(f"Built {len(runs)} run date(s) into {args.db.resolve()}")
+    for as_of, runs in batches:
+        print_batch(as_of, runs)
+    print(f"\nbatch_id {run_log.batch_id}  (details: python run_models.py log --batch {run_log.batch_id})")
+    if not batch_succeeded(batches[-1][1]):
+        raise SystemExit(f"Batch as_of {batches[-1][0]} failed; later batches were not run.")
+    print(f"Ran {len(batches)} batch(es) into {args.db.resolve()}")
 
 
 if __name__ == "__main__":

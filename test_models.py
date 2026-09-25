@@ -4,13 +4,13 @@ import shutil
 import tempfile
 import unittest
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
 
 from dag import CycleError, MissingUpstreamError, TaskFailedError, TaskState
-from run_models import ModelError, PartitionError, build, build_range, load_models
+from run_models import ModelError, PartitionError, build, load_models
 from verify_idempotency import compare, fingerprint, run_twice, snapshot
 
 ROOT = Path(__file__).resolve().parent
@@ -19,6 +19,14 @@ MODELS_DIR = ROOT / "models"
 RUN_DATE = date(2026, 6, 15)
 
 logging.disable(logging.CRITICAL)  # dag.py logs tracebacks for the failures tested below
+
+
+def build_dates(con, models_dir, data_dir, start, end):
+    """Build every run_date from start to end with all bills visible, failing on any error."""
+    d = start
+    while d <= end:
+        build(con, models_dir, data_dir, d).raise_for_failures()
+        d += timedelta(days=1)
 
 
 def read_raw_shipments(data_dir=DATA_DIR):
@@ -34,8 +42,7 @@ class ModelTests(unittest.TestCase):
         cls.raw = read_raw_shipments()
         dates = sorted(date.fromisoformat(r["pickup_date"]) for r in cls.raw)
         cls.con = duckdb.connect(":memory:")
-        for _, result in build_range(cls.con, MODELS_DIR, DATA_DIR, dates[0], dates[-1]):
-            result.raise_for_failures()
+        build_dates(cls.con, MODELS_DIR, DATA_DIR, dates[0], dates[-1])
 
     @classmethod
     def tearDownClass(cls):
@@ -280,8 +287,7 @@ class IdempotencyTests(ScratchModelsTestCase):
             self.assertEqual(second.results[name].output.inserted, first.results[name].output.inserted, name)
 
     def test_rerun_leaves_other_dates_untouched(self):
-        for _, result in build_range(self.con, self.models, self.data, date(2026, 6, 10), date(2026, 6, 20)):
-            result.raise_for_failures()
+        build_dates(self.con, self.models, self.data, date(2026, 6, 10), date(2026, 6, 20))
         before = snapshot(self.con)
         self.build(RUN_DATE).raise_for_failures()
         self.assertSnapshotsEqual(before, snapshot(self.con))

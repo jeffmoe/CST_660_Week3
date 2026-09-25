@@ -10,6 +10,12 @@
 -- (same shipment_id, later bill_received_date, corrected amounts). The most
 -- recently received bill wins. Copies of a shipment share its pickup_date, so
 -- deduplicating within one run_date's partition is enough.
+--
+-- Late-arriving bills: only bills received on or before the as_of date are
+-- visible, as they would have been on that day. Bills usually arrive days
+-- after pickup, so a partition fills in as later batches reprocess it inside
+-- their lookback window, and a re-sent bill replaces the original then. An
+-- as_of of null (direct builds) sees every bill.
 
 with source as (
     select *
@@ -34,6 +40,7 @@ select *
 from cleaned
 where shipment_id is not null
   and pickup_date = getvariable('run_date')
+  and (getvariable('as_of') is null or bill_received_date <= getvariable('as_of'))
   and delivery_date >= pickup_date
   and weight_lbs > 0
   and linehaul_revenue >= 0
