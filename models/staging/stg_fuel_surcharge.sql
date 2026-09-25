@@ -1,4 +1,5 @@
 -- depends_on: none (reads raw CSV)
+-- partition_by: rate_date
 
 -- One row per date: diesel price and the fuel surcharge percentage in effect,
 -- cleaned and typed from the raw fuel surcharge CSV.
@@ -18,6 +19,6 @@ cleaned as (
 
 select *
 from cleaned
-where rate_date is not null
+where rate_date = getvariable('run_date')
   and fuel_surcharge_pct >= 0
 qualify row_number() over (partition by rate_date order by fuel_surcharge_pct desc) = 1

@@ -1,4 +1,5 @@
 -- depends_on: none (reads raw CSV)
+-- partition_by: pickup_date
 
 -- One row per shipment, cleaned and typed from the raw shipments CSV.
 --
@@ -7,7 +8,8 @@
 --
 -- Deduplication: the feed contains exact duplicate rows and re-sent bills
 -- (same shipment_id, later bill_received_date, corrected amounts). The most
--- recently received bill wins.
+-- recently received bill wins. Copies of a shipment share its pickup_date, so
+-- deduplicating within one run_date's partition is enough.
 
 with source as (
     select *
@@ -31,7 +33,7 @@ cleaned as (
 select *
 from cleaned
 where shipment_id is not null
-  and pickup_date is not null
+  and pickup_date = getvariable('run_date')
   and delivery_date >= pickup_date
   and weight_lbs > 0
   and linehaul_revenue >= 0

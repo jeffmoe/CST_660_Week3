@@ -1,4 +1,5 @@
 -- depends_on: staging.stg_shipments, staging.stg_lanes, staging.stg_fuel_surcharge
+-- partition_by: pickup_date
 
 -- One row per shipment with its lane and its cost and revenue including fuel surcharge.
 --
@@ -11,6 +12,7 @@
 
 with shipments as (
     select * from staging.stg_shipments
+    where pickup_date = getvariable('run_date')
 ),
 
 lanes as (
@@ -18,6 +20,7 @@ lanes as (
 ),
 
 fuel as (
+    -- All loaded dates, not just run_date: the ASOF join may need an earlier rate.
     select * from staging.stg_fuel_surcharge
 ),
 

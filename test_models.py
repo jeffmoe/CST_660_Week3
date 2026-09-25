@@ -4,28 +4,38 @@ import shutil
 import tempfile
 import unittest
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 import duckdb
 
 from dag import CycleError, MissingUpstreamError, TaskFailedError, TaskState
-from run_models import ModelError, build, load_models
+from run_models import ModelError, PartitionError, build, build_range, load_models
+from verify_idempotency import compare, fingerprint, run_twice, snapshot
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 MODELS_DIR = ROOT / "models"
+RUN_DATE = date(2026, 6, 15)
 
 logging.disable(logging.CRITICAL)  # dag.py logs tracebacks for the failures tested below
 
 
+def read_raw_shipments(data_dir=DATA_DIR):
+    with open(Path(data_dir) / "shipments.csv", newline="") as f:
+        return list(csv.DictReader(f))
+
+
 class ModelTests(unittest.TestCase):
+    """Data checks on a full backfill of every pickup date in the raw data."""
+
     @classmethod
     def setUpClass(cls):
+        cls.raw = read_raw_shipments()
+        dates = sorted(date.fromisoformat(r["pickup_date"]) for r in cls.raw)
         cls.con = duckdb.connect(":memory:")
-        result = build(cls.con, MODELS_DIR, DATA_DIR)
-        result.raise_for_failures()
-        with open(DATA_DIR / "shipments.csv", newline="") as f:
-            cls.raw = list(csv.DictReader(f))
+        for _, result in build_range(cls.con, MODELS_DIR, DATA_DIR, dates[0], dates[-1]):
+            result.raise_for_failures()
 
     @classmethod
     def tearDownClass(cls):
@@ -108,30 +118,42 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(mart, inter)
 
 
-class DagTests(unittest.TestCase):
-    """How run_models turns model files into a DAG, using a scratch copy of models/."""
+class ScratchModelsTestCase(unittest.TestCase):
+    """Gives each test its own copy of models/ and data/ plus an empty in-memory database."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.models = Path(tmp.name) / "models"
+        self.data = Path(tmp.name) / "data"
         shutil.copytree(MODELS_DIR, self.models)
+        shutil.copytree(DATA_DIR, self.data)
         self.con = duckdb.connect(":memory:")
         self.addCleanup(self.con.close)
 
+    def build(self, run_date=RUN_DATE, con=None):
+        return build(con or self.con, self.models, self.data, run_date)
+
     def write_model(self, rel_path, sql):
+        """Write a model file, adding '-- partition_by: none' unless the SQL declares one."""
+        if "partition_by:" not in sql:
+            sql = "-- partition_by: none\n" + sql
         (self.models / rel_path).write_text(sql, encoding="utf-8")
 
-    def count(self, table):
-        return self.con.execute(f"select count(*) from {table}").fetchone()[0]
+    def count(self, table, where="true"):
+        return self.con.execute(f"select count(*) from {table} where {where}").fetchone()[0]
 
     def tables(self):
         return {f"{s}.{t}" for s, t in self.con.execute(
-            "select schema_name, table_name from duckdb_tables()").fetchall()}
+            "select schema_name, table_name from duckdb_tables() where not temporary").fetchall()}
 
-    def test_dependencies_come_from_headers(self):
-        deps = {m.key: set(m.depends_on) for m in load_models(self.models)}
-        self.assertEqual(deps, {
+
+class DagTests(ScratchModelsTestCase):
+    """How run_models turns model files into a DAG."""
+
+    def test_headers_are_parsed(self):
+        models = {m.key: m for m in load_models(self.models)}
+        self.assertEqual({k: set(m.depends_on) for k, m in models.items()}, {
             "staging.stg_fuel_surcharge": set(),
             "staging.stg_lanes": set(),
             "staging.stg_shipments": set(),
@@ -139,24 +161,31 @@ class DagTests(unittest.TestCase):
                 "staging.stg_shipments", "staging.stg_lanes", "staging.stg_fuel_surcharge"},
             "marts.mart_daily_lane_margin": {"intermediate.int_shipment_lane_costs"},
         })
+        self.assertEqual({k: m.partition_by for k, m in models.items()}, {
+            "staging.stg_fuel_surcharge": "rate_date",
+            "staging.stg_lanes": None,
+            "staging.stg_shipments": "pickup_date",
+            "intermediate.int_shipment_lane_costs": "pickup_date",
+            "marts.mart_daily_lane_margin": "ship_date",
+        })
 
     def test_run_order_is_topological(self):
-        order = build(self.con, self.models, DATA_DIR).order
+        order = self.build().order
         self.assertLess(order.index("staging.stg_shipments"),
                         order.index("intermediate.int_shipment_lane_costs"))
         self.assertLess(order.index("intermediate.int_shipment_lane_costs"),
                         order.index("marts.mart_daily_lane_margin"))
 
-    def test_failure_skips_downstream_and_keeps_previous_tables(self):
-        build(self.con, self.models, DATA_DIR)
-        before = self.count("marts.mart_daily_lane_margin")
+    def test_failure_skips_downstream_and_keeps_previous_rows(self):
+        self.build()
+        before = snapshot(self.con)
 
         # Break one staging model and add an independent mart that should still build.
         self.write_model("staging/stg_fuel_surcharge.sql",
-                         "-- depends_on: none\nselect * from no_such_table")
+                         "-- depends_on: none\n-- partition_by: rate_date\nselect * from no_such_table")
         self.write_model("marts/mart_lane_list.sql",
                          "-- depends_on: staging.stg_lanes\nselect lane_id from staging.stg_lanes")
-        result = build(self.con, self.models, DATA_DIR)
+        result = self.build()
 
         states = {n: r.state for n, r in result.results.items()}
         self.assertEqual(states["staging.stg_fuel_surcharge"], TaskState.FAILED)
@@ -169,9 +198,11 @@ class DagTests(unittest.TestCase):
         with self.assertRaises(TaskFailedError):
             result.raise_for_failures()
 
-        # Failed and skipped models keep the tables from the last good build.
-        self.assertEqual(self.count("staging.stg_fuel_surcharge"), 110)
-        self.assertEqual(self.count("marts.mart_daily_lane_margin"), before)
+        # Failed and skipped models keep their rows from the last good run.
+        after = snapshot(self.con)
+        for table in ("staging.stg_fuel_surcharge", "intermediate.int_shipment_lane_costs",
+                      "marts.mart_daily_lane_margin"):
+            self.assertEqual(after[table], before[table], table)
         self.assertEqual(self.count("marts.mart_lane_list"), 60)
 
     def test_cycle_fails_before_anything_runs(self):
@@ -180,7 +211,7 @@ class DagTests(unittest.TestCase):
         self.write_model("intermediate/int_b.sql",
                          "-- depends_on: intermediate.int_a\nselect * from intermediate.int_a")
         with self.assertRaises(CycleError) as ctx:
-            build(self.con, self.models, DATA_DIR)
+            self.build()
         self.assertIn("intermediate.int_a", str(ctx.exception))
         self.assertEqual(self.tables(), set())
 
@@ -188,40 +219,144 @@ class DagTests(unittest.TestCase):
         self.write_model("marts/mart_x.sql",
                          "-- depends_on: intermediate.int_nope\nselect * from intermediate.int_nope")
         with self.assertRaises(MissingUpstreamError):
-            build(self.con, self.models, DATA_DIR)
+            self.build()
         self.assertEqual(self.tables(), set())
 
     def test_undeclared_reference_is_rejected(self):
-        self.write_model("marts/mart_x.sql",
-                         "-- depends_on: none\nselect * from staging.stg_lanes")
+        self.write_model("marts/mart_x.sql", "-- depends_on: none\nselect * from staging.stg_lanes")
         with self.assertRaisesRegex(ModelError, "does not declare"):
-            build(self.con, self.models, DATA_DIR)
+            self.build()
 
     def test_unused_declaration_is_rejected(self):
         self.write_model("marts/mart_x.sql",
                          "-- depends_on: staging.stg_lanes, staging.stg_shipments\n"
                          "select * from staging.stg_lanes")
         with self.assertRaisesRegex(ModelError, "never reads"):
-            build(self.con, self.models, DATA_DIR)
+            self.build()
 
     def test_comments_are_not_dependencies(self):
         self.write_model("marts/mart_x.sql",
                          "-- depends_on: staging.stg_lanes\n"
                          "-- unlike marts.mart_daily_lane_margin, this is one row per lane\n"
                          "select * from staging.stg_lanes")
-        self.assertTrue(build(self.con, self.models, DATA_DIR).succeeded)
+        self.assertTrue(self.build().succeeded)
 
-    def test_missing_header_is_rejected(self):
+    def test_missing_depends_on_is_rejected(self):
         self.write_model("marts/mart_x.sql", "select 1 as x")
         with self.assertRaisesRegex(ModelError, "missing '-- depends_on:'"):
-            build(self.con, self.models, DATA_DIR)
+            self.build()
+
+    def test_missing_partition_by_is_rejected(self):
+        (self.models / "marts" / "mart_x.sql").write_text("-- depends_on: none\nselect 1 as x")
+        with self.assertRaisesRegex(ModelError, "missing '-- partition_by:'"):
+            self.build()
 
     def test_reading_a_later_layer_is_rejected(self):
         self.write_model("staging/stg_x.sql",
                          "-- depends_on: marts.mart_daily_lane_margin\n"
                          "select * from marts.mart_daily_lane_margin")
         with self.assertRaisesRegex(ModelError, "later layer"):
-            build(self.con, self.models, DATA_DIR)
+            self.build()
+
+
+class IdempotencyTests(ScratchModelsTestCase):
+    """Running a run_date again must leave every table exactly as it was."""
+
+    def assertSnapshotsEqual(self, first, second):
+        self.assertTrue(first, "snapshot should not be empty")
+        mismatched = [t for t, _, _, ok in compare(first, second) if not ok]
+        self.assertEqual(mismatched, [], "tables changed between runs")
+
+    def test_same_date_twice_on_empty_database(self):
+        first, second = run_twice(self.con, self.models, self.data, RUN_DATE)
+        self.assertSnapshotsEqual(first, second)
+        self.assertTrue(all(rows > 0 for rows, _ in first.values()))
+
+    def test_second_run_replaces_exactly_what_the_first_inserted(self):
+        first = self.build()
+        second = self.build()
+        for name in second.order:
+            self.assertEqual(second.results[name].output.deleted, first.results[name].output.inserted, name)
+            self.assertEqual(second.results[name].output.inserted, first.results[name].output.inserted, name)
+
+    def test_rerun_leaves_other_dates_untouched(self):
+        for _, result in build_range(self.con, self.models, self.data, date(2026, 6, 10), date(2026, 6, 20)):
+            result.raise_for_failures()
+        before = snapshot(self.con)
+        self.build(RUN_DATE).raise_for_failures()
+        self.assertSnapshotsEqual(before, snapshot(self.con))
+
+    def test_order_of_dates_does_not_matter(self):
+        d1, d2 = date(2026, 6, 15), date(2026, 6, 16)
+        other = duckdb.connect(":memory:")
+        self.addCleanup(other.close)
+        for d in (d1, d2):
+            self.build(d, con=self.con)
+        for d in (d2, d1):
+            self.build(d, con=other)
+        self.assertSnapshotsEqual(snapshot(self.con), snapshot(other))
+
+    def test_rerun_picks_up_changed_source_data(self):
+        self.build()
+        before = self.count("staging.stg_shipments")
+
+        # Drop one of run_date's shipments from the raw feed and rerun: replaced, not appended.
+        raw = read_raw_shipments(self.data)
+        victim = next(r["shipment_id"] for r in raw if r["pickup_date"] == RUN_DATE.isoformat())
+        with open(self.data / "shipments.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(raw[0]))
+            w.writeheader()
+            w.writerows(r for r in raw if r["shipment_id"] != victim)
+        self.build().raise_for_failures()
+
+        self.assertEqual(self.count("staging.stg_shipments"), before - 1)
+        self.assertEqual(self.count("intermediate.int_shipment_lane_costs", f"shipment_id = '{victim}'"), 0)
+
+    def test_fingerprint_catches_duplicates_and_changes_but_not_row_order(self):
+        self.build()
+        table = "marts.mart_daily_lane_margin"
+        rows, checksum = fingerprint(self.con, table)
+
+        # Same rows in a different physical order: identical fingerprint.
+        self.con.execute(f"create table marts.shuffled as select * from {table} order by margin desc")
+        self.assertEqual(fingerprint(self.con, "marts.shuffled"), (rows, checksum))
+
+        # A duplicated row, as a non-idempotent append would produce.
+        self.con.execute(f"insert into {table} select * from {table} limit 1")
+        dup_rows, dup_checksum = fingerprint(self.con, table)
+        self.assertEqual(dup_rows, rows + 1)
+        self.assertNotEqual(dup_checksum, checksum)
+
+        # A changed value with the row count unchanged.
+        self.con.execute("update marts.shuffled set margin = margin + 0.01 "
+                         "where lane_id = (select min(lane_id) from marts.shuffled)")
+        changed_rows, changed_checksum = fingerprint(self.con, "marts.shuffled")
+        self.assertEqual(changed_rows, rows)
+        self.assertNotEqual(changed_checksum, checksum)
+
+    def test_model_writing_other_dates_fails_and_writes_nothing(self):
+        self.build(date(2026, 6, 14))
+        # Forgets to filter on run_date, so it returns every loaded pickup date.
+        self.write_model("marts/mart_all_dates.sql",
+                         "-- depends_on: intermediate.int_shipment_lane_costs\n"
+                         "-- partition_by: pickup_date\n"
+                         "select * from intermediate.int_shipment_lane_costs")
+        result = self.build(RUN_DATE)
+
+        r = result.results["marts.mart_all_dates"]
+        self.assertEqual(r.state, TaskState.FAILED)
+        self.assertIsInstance(r.error, PartitionError)
+        self.assertIn("other than run_date", str(r.error))
+        self.assertNotIn("marts.mart_all_dates", self.tables())  # rolled back, table never created
+        self.assertTrue(result.results["marts.mart_daily_lane_margin"].state is TaskState.SUCCESS)
+
+    def test_partition_column_must_be_in_output(self):
+        self.write_model("marts/mart_x.sql",
+                         "-- depends_on: staging.stg_lanes\n-- partition_by: ship_date\n"
+                         "select lane_id from staging.stg_lanes")
+        r = self.build().results["marts.mart_x"]
+        self.assertEqual(r.state, TaskState.FAILED)
+        self.assertIsInstance(r.error, PartitionError)
 
 
 if __name__ == "__main__":

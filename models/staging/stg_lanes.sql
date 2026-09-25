@@ -1,4 +1,5 @@
 -- depends_on: none (reads raw CSV)
+-- partition_by: none (small dimension, fully replaced every run)
 
 -- One row per origin/destination ZIP pair, cleaned and typed from the raw lanes CSV.
 

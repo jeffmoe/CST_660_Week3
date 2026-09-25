@@ -1,10 +1,12 @@
 -- depends_on: intermediate.int_shipment_lane_costs
+-- partition_by: ship_date
 
 -- Margin per lane per day, dated by pickup date (the same date the fuel
 -- surcharge rate is taken from). Revenue and cost both include fuel surcharge.
 
 with shipment_costs as (
     select * from intermediate.int_shipment_lane_costs
+    where pickup_date = getvariable('run_date')
 )
 
 select
