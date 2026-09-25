@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local DuckDB warehouse (rebuilt by run_models.py)
+*.duckdb
+*.duckdb.wal
