@@ -1,6 +1,63 @@
 # CST_660_Week3
 Repo for Orchistrated Batch Pipeline
 
+## On-call runbook
+
+Run everything from the repo root after `.venv\Scripts\activate`. The database is `warehouse.duckdb`.
+
+**The DAG.** Every date (partition) runs these five tasks, top to bottom:
+
+```
+staging.stg_shipments ──────┐
+staging.stg_lanes ──────────┼──> intermediate.int_shipment_lane_costs ──> marts.mart_daily_lane_margin
+staging.stg_fuel_surcharge ─┘
+```
+
+If a task fails, everything below it is **skipped** and keeps yesterday's rows. Tasks beside it still run. The run stops at that date and exits with code 1.
+
+**Run one date** (the normal daily job):
+
+```
+python run_models.py run --date 2026-07-06
+```
+
+This rebuilds 2026-07-06 and the 21 days before it, using the bills received by 2026-07-06. Exit code 0 means done. On exit code 1, read the FAILED line it prints, fix the cause, and run the same command again.
+
+**Run a backfill range:**
+
+```
+python run_models.py backfill --start 2026-06-01 --end 2026-09-15
+```
+
+This replays the daily job for each date in order; the full range takes about 4 minutes. It stops at the first failure. To resume, rerun with `--start` set to the date that failed. Earlier dates don't need redoing.
+
+**See what happened:** `python run_models.py log` shows the latest run; add `--batch <id>` for a specific one. A task stuck in `running` means the process died mid-task. Rerun the date.
+
+**If you see "being used by another process":** another run has the database open. Wait for it to finish. Don't delete the file.
+
+**Test the failure switch** (PowerShell):
+
+```powershell
+$env:NWF_FAIL_TASK = "intermediate.int_shipment_lane_costs"
+python run_models.py run --date 2026-07-06   # expect: intermediate FAILED, mart SKIPPED, exit 1
+Remove-Item Env:NWF_FAIL_TASK
+python run_models.py run --date 2026-07-06   # expect: exit 0
+```
+
+`python demo_failure_recovery.py` does the same thing in memory and checks every step. If real runs fail with `InjectedFailure`, someone left the switch on: `Remove-Item Env:NWF_FAIL_TASK`.
+
+**Idempotence: rerunning is always safe.** Each task replaces one date's rows in a single transaction (delete, then insert). A failure rolls back, so a date always has either its old rows or its new rows, never half of each. Running the same date twice gives identical tables; check it with `python verify_idempotency.py --run-date <date>`.
+
+| Layer | Rerunning a date replaces | Given the same |
+|---|---|---|
+| staging `stg_shipments` | that pickup date's shipments, one row per shipment (newest bill wins) | feed file and `--date` |
+| staging `stg_fuel_surcharge` | that date's fuel rate | feed file |
+| staging `stg_lanes` | the whole lanes table | feed file |
+| intermediate | that pickup date's shipment costs | staging tables |
+| marts | that ship date's lane margins | intermediate table |
+
+Expected, not a bug: a date's numbers keep growing for up to 21 days as late bills arrive. A bill that arrives more than 21 days after pickup is missed unless you rerun with a bigger `--lookback`.
+
 ## SQL models
 
 Transformations live in `models/`, one model per `.sql` file. Each file is a single `SELECT`, and `run_models.py` builds it into a local DuckDB database (`warehouse.duckdb`). The folder name becomes the schema and the file name becomes the table.
