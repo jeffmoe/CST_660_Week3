@@ -7,7 +7,7 @@ Transformations live in `models/`, one model per `.sql` file. Each file is a sin
 
 | Layer | Model | What it does |
 |---|---|---|
-| staging | `stg_shipments` | Casts types, keeps ZIP leading zeros, drops invalid rows, dedupes on `shipment_id` (latest bill wins) |
+| staging | `stg_shipments` | Casts types and keeps ZIP leading zeros. Keeps the newest version of each `shipment_id` (latest `bill_received_date`, then latest line in the feed), then drops it if invalid |
 | staging | `stg_lanes` | Types the lanes CSV; one row per origin/destination ZIP pair |
 | staging | `stg_fuel_surcharge` | Types the fuel surcharge CSV; one row per date |
 | intermediate | `int_shipment_lane_costs` | Per shipment: its lane, plus the fuel surcharge rate in effect on the pickup date, applied to cost and revenue |
@@ -20,7 +20,7 @@ python run_models.py run --date 2026-06-15                               # daily
 python run_models.py backfill --start 2026-06-01 --end 2026-09-15         # replay daily batches in order
 python run_models.py log                                                 # summarize the latest batch
 python verify_idempotency.py --run-date 2026-06-15                       # build a day twice and compare
-python -m unittest -v test_dag test_models test_backfill
+python -m unittest -v test_dag test_models test_backfill test_dedup
 ```
 
 ### Dependencies and the DAG runner

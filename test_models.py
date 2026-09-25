@@ -62,13 +62,14 @@ class ModelTests(unittest.TestCase):
 
     def test_resent_bill_keeps_latest(self):
         by_id = defaultdict(list)
-        for r in self.raw:
-            by_id[r["shipment_id"]].append(r)
+        for line, r in enumerate(self.raw, start=1):
+            by_id[r["shipment_id"]].append((line, r))
         resent = {sid: rows for sid, rows in by_id.items()
-                  if len({tuple(r.values()) for r in rows}) > 1}
+                  if len({tuple(r.values()) for _, r in rows}) > 1}
         self.assertTrue(resent, "raw data should contain re-sent bills")
         for sid, rows in resent.items():
-            latest = max(rows, key=lambda r: r["bill_received_date"])
+            # Latest bill date wins; on a same-day tie, the row later in the file wins.
+            _, latest = max(rows, key=lambda lr: (lr[1]["bill_received_date"], lr[0]))
             got = self.con.execute(
                 "select bill_received_date::varchar, linehaul_revenue::varchar "
                 "from staging.stg_shipments where shipment_id = ?", [sid]).fetchone()
