@@ -168,10 +168,10 @@ class RunLogTests(ScratchModelsTestCase):
         seen = []
         real = run_models.write_partition
 
-        def spy(con, m):
+        def spy(con, m, **kwargs):
             seen.append(con.execute("select status from ops.run_log where task_name = ? "
                                     "order by log_id desc limit 1", [m.key]).fetchone()[0])
-            return real(con, m)
+            return real(con, m, **kwargs)
 
         with mock.patch.object(run_models, "write_partition", spy):
             build(self.con, self.models, self.data, date(2026, 6, 15))
@@ -199,7 +199,7 @@ class RunLogTests(ScratchModelsTestCase):
         self.assertEqual(self.log_rows("status = 'running'"), [])
 
     def test_interrupted_task_is_logged_as_failed(self):
-        def interrupted(con, m):
+        def interrupted(con, m, **kwargs):
             raise KeyboardInterrupt
 
         with mock.patch.object(run_models, "write_partition", interrupted):

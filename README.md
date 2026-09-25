@@ -20,7 +20,8 @@ python run_models.py run --date 2026-06-15                               # daily
 python run_models.py backfill --start 2026-06-01 --end 2026-09-15         # replay daily batches in order
 python run_models.py log                                                 # summarize the latest batch
 python verify_idempotency.py --run-date 2026-06-15                       # build a day twice and compare
-python -m unittest -v test_dag test_models test_backfill test_dedup
+python demo_failure_recovery.py                                          # fail a task on purpose, then recover
+python -m unittest -v test_dag test_models test_backfill test_dedup test_failure_toggle
 ```
 
 ### Dependencies and the DAG runner
@@ -102,3 +103,28 @@ order by log_id;
 ```
 
 The run log lives in its own `ops` schema, so the idempotency checksums ignore it.
+
+### Deliberate failures
+
+Set `NWF_FAIL_TASK` to one or more task names (comma-separated) and those tasks raise `InjectedFailure` partway through their write: after the partition's rows are deleted, before the new rows are inserted. Unset it to turn the switch off. A name that isn't a task stops the run before anything executes, so a typo can't silently leave the switch off.
+
+In PowerShell:
+
+```powershell
+$env:NWF_FAIL_TASK = "intermediate.int_shipment_lane_costs"
+python run_models.py run --date 2026-07-06     # intermediate FAILED, mart SKIPPED, exit code 1
+Remove-Item Env:NWF_FAIL_TASK
+python run_models.py run --date 2026-07-06     # every task succeeds
+python run_models.py log                       # latest batch; use --batch <id> for the failed one
+```
+
+What happens:
+- the failed task's transaction rolls back, so its partition keeps its previous rows;
+- every task downstream of it is skipped and keeps its previous rows;
+- independent tasks, like the staging models, still run;
+- the batch (or backfill) stops at that partition;
+- the failure and the skips are recorded in `ops.run_log`.
+
+Rerunning the same date with the switch off rebuilds everything.
+
+`python demo_failure_recovery.py` runs all of this against an in-memory database: a baseline batch, a failing batch, and a recovery batch. It checks that the mart was skipped, that the failure left every table identical to the baseline, and that the recovery run matches the baseline row for row. Add `--db warehouse.duckdb` to run it against the real warehouse.

@@ -47,6 +47,12 @@ Commands:
 Every task's start, end, rows deleted and inserted, status, and any error is
 written to the DuckDB table ops.run_log (see run_log.py).
 
+Deliberate failures: set NWF_FAIL_TASK to one or more task names (comma
+separated) and those tasks raise InjectedFailure partway through their write,
+after the delete and before the insert. Their downstream tasks are skipped,
+and the transaction rollback leaves the partition as it was. Unset the
+variable and rerun to recover. See demo_failure_recovery.py.
+
 Examples:
   python run_models.py run --date 2026-06-15
   python run_models.py backfill --start 2026-06-01 --end 2026-09-15 --lookback 21
@@ -55,6 +61,7 @@ Examples:
 
 import argparse
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -79,6 +86,11 @@ LINE_COMMENT = re.compile(r"--[^\n]*")
 MODEL_REF = re.compile(r"\b(" + "|".join(LAYERS) + r")\s*\.\s*(\w+)\b", re.IGNORECASE)
 IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 
+# Deliberate failure switch for demos and tests: a comma-separated list of task
+# names, e.g. NWF_FAIL_TASK=intermediate.int_shipment_lane_costs
+FAIL_TASK_ENV = "NWF_FAIL_TASK"
+log = logging.getLogger(__name__)
+
 
 class ModelError(DAGError):
     """A model file is invalid: bad header, or it reads a later layer."""
@@ -86,6 +98,10 @@ class ModelError(DAGError):
 
 class PartitionError(Exception):
     """A model returned rows outside the run_date partition it writes."""
+
+
+class InjectedFailure(Exception):
+    """A deliberate failure requested with the NWF_FAIL_TASK environment variable."""
 
 
 @dataclass
@@ -170,8 +186,23 @@ def load_models(models_dir):
     return models
 
 
-def write_partition(con, m):
-    """Replace model m's run_date partition in one transaction. Returns WriteStats."""
+def injected_failures(models):
+    """Task names listed in NWF_FAIL_TASK. Unknown names raise ModelError, so a typo can't
+    quietly turn the switch off."""
+    names = {n.strip().lower() for n in os.environ.get(FAIL_TASK_ENV, "").split(",") if n.strip()}
+    unknown = names - {m.key for m in models}
+    if unknown:
+        raise ModelError(f"{FAIL_TASK_ENV} names unknown task(s): {', '.join(sorted(unknown))}. "
+                         f"Tasks: {', '.join(m.key for m in models)}")
+    return frozenset(names)
+
+
+def write_partition(con, m, inject_failure=False):
+    """Replace model m's run_date partition in one transaction. Returns WriteStats.
+
+    With inject_failure, raise InjectedFailure after the delete and before the
+    insert, so the rollback that restores the partition is exercised too.
+    """
     con.execute("begin transaction")
     try:
         con.execute(f"create or replace temp table _model_output as\n{m.sql}\n")
@@ -193,6 +224,9 @@ def write_partition(con, m):
 
         con.execute(f"create table if not exists {m.table} as select * from _model_output limit 0")
         deleted = con.execute(delete).fetchone()[0]
+        if inject_failure:
+            raise InjectedFailure(f"deliberate failure because {FAIL_TASK_ENV} includes {m.key}; "
+                                  f"the {deleted} rows just deleted are rolled back")
         inserted = con.execute(f"insert into {m.table} by name select * from _model_output").fetchone()[0]
         con.execute("drop table _model_output")
         con.execute("commit")
@@ -202,14 +236,15 @@ def write_partition(con, m):
     return WriteStats(deleted, inserted)
 
 
-def build_dag(con, models, run_date, as_of, run_log):
-    """One DAG task per model. Each task logs its start and end to the run log."""
+def build_dag(con, models, run_date, as_of, run_log, fail_tasks=frozenset()):
+    """One DAG task per model. Each task logs its start and end to the run log.
+    Tasks named in fail_tasks raise InjectedFailure mid-write."""
     dag = DAG("sql_models")
     for m in models:
         def task(m=m):
             log_id = run_log.start(m.key, run_date, as_of)
             try:
-                stats = write_partition(con, m)
+                stats = write_partition(con, m, inject_failure=m.key in fail_tasks)
             except BaseException as exc:
                 run_log.finish(log_id, error=exc)
                 raise
@@ -232,7 +267,10 @@ def build(con, models_dir, data_dir, run_date, as_of=None, run_log=None):
     """
     run_log = run_log or RunLog(con, "build")
     models = load_models(models_dir)
-    dag = build_dag(con, models, run_date, as_of, run_log)
+    fail_tasks = injected_failures(models)
+    if fail_tasks:
+        log.warning("%s is set: %s will fail on purpose", FAIL_TASK_ENV, ", ".join(sorted(fail_tasks)))
+    dag = build_dag(con, models, run_date, as_of, run_log, fail_tasks)
     dag.topological_order()  # fail on cycles/unknown models before touching the database
 
     data_dir = str(Path(data_dir).resolve()).replace("'", "''")

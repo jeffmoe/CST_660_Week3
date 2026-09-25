@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import shutil
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 import duckdb
 
 from dag import CycleError, MissingUpstreamError, TaskFailedError, TaskState
-from run_models import ModelError, PartitionError, build, load_models
+from run_models import FAIL_TASK_ENV, ModelError, PartitionError, build, load_models
 from verify_idempotency import compare, fingerprint, run_twice, snapshot
 
 ROOT = Path(__file__).resolve().parent
@@ -19,6 +20,9 @@ MODELS_DIR = ROOT / "models"
 RUN_DATE = date(2026, 6, 15)
 
 logging.disable(logging.CRITICAL)  # dag.py logs tracebacks for the failures tested below
+# A failure switch left set in the shell would fail unrelated tests. test_failure_toggle.py
+# sets it explicitly where it's wanted.
+os.environ.pop(FAIL_TASK_ENV, None)
 
 
 def build_dates(con, models_dir, data_dir, start, end):
